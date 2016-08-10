@@ -1,0 +1,13 @@
+Sovren.configure do |c|
+  # You must set both account_id & service_key.
+<% if account_id -%>
+  c.account_id = <%= account_id %>
+<% else -%>
+  c.account_id = Rails.application.secrets.sovren_account_id
+<% end -%>
+<% if service_key -%>
+  c.service_key = '<%= service_key %>'
+<% else -%>
+  c.service_key = Rails.application.secrets.sovren_service_key
+<% end -%>
+end

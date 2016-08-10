@@ -1,52 +1,135 @@
 module Sovren
   class Client
-    attr_reader :endpoint, :username, :password, :timeout, :hard_time_out_multiplier, :parser_configuration_params
+    def initialize file, options={}
+      @client = Savon.client(wsdl:"https://services.resumeparsing.com/ParsingService.asmx?WSDL", :log => false)
 
-    #Initialize the client class that will be used for all sovren requests.
-    #
-    # @param [Hash] options
-    # @option options String :endpoint The url that the web service is located at
-    # @option options String :username The HTTP Basic auth username for the webservice
-    # @option options String :password The HTTP Basic auth password for the webservice
-    # @option options Integer :timeout The timeout for the parser
-    # @option options Integer :hard_time_out_multiplier The hard timeout for the parser
-    # @option options Integer :parser_configuration_params The parser configuration params, used to tweak the output of the parser
+      @response = @client.call(:parse_resume, message: { "request" => {
+        "AccountId"     => Sovren.configuration.account_id,
+        "ServiceKey"    => Sovren.configuration.service_key,
+        "FileBytes"     => Base64.encode64(file.read),
+        "OutputHtml"    => true,
+        "Configuration" => nil,
+        "RevisionDate"  => nil,
+      } })
 
-    def initialize(options={})
-      @endpoint = options[:endpoint]
-      @username = options[:username]
-      @password = options[:password]
-      @timeout = options[:timout] || 30000
-      @hard_time_out_multiplier = options[:hard_time_out_multiplier] || 2     
-      @parser_configuration_params = options[:parser_configuration_params] || "_100000_0_00000010_0000000110101100_1_0000000000000111111102000000000010000100000000000000"
+      @result = @response.to_hash[:parse_resume_response][:parse_resume_result]
+
+      @doc = Nokogiri::XML(@result[:xml]).remove_namespaces!
     end
 
-    def connection
-      Savon.client(wsdl: endpoint, log: false)
+    def all
+      {
+        user: user_info,
+        educations: educations,
+        internships: internships,
+        employments: employments,
+      }
     end
 
-    def parse(file)
-      result = connection.call(:parse) do |c|
-        c.message({
-          "DocumentAsByteArray" => Base64.encode64(file),
-          "ParserConfigurationParams" => parser_configuration_params,
-          "AlsoUseSovrenTaxonomy" => true,
-          "EmbedConvertedTextInHrXml" => true,
-          "HardTimeOutMultiplier" => hard_time_out_multiplier,
-          "TimeOutInMs" => timeout})
+    def user_info
+      majors = {}
+
+      educations.each do |edu|
+        type = edu[:degreeType]
+        major = edu[:major]
+        if type && major
+          if majors[type]
+            majors[type] << major
+          else
+            majors[type] = [major]
+          end
+        end
       end
 
-      Resume.parse(result.body[:parse_response][:parse_result])
+      hsh = {
+        first_name: @doc.at_css('PersonName GivenName'),
+        last_name: @doc.at_css('PersonName FamilyName'),
+        name: @doc.at_css('PersonName FormattedName'),
+        phone: @doc.at_css('Telephone FormattedNumber') || @doc.at_css('Mobile FormattedNumber'),
+        email: @doc.at_css('InternetEmailAddress'),
+        majors: majors
+      }
+
+      format_hash hsh
     end
 
-    def convert(file, format)
-      result = connection.call(:do_conversion_simplified) do |c|
-        c.message({
-          "DocumentAsByteArray" => Base64.encode64(file),
-          "OutputType" => format})
+    def educations
+      @doc.css('SchoolOrInstitution').map do |edu|
+        {
+          degreeType: edu.at_css('Degree').attr('degreeType'),
+          degree: edu.at_css('Degree DegreeName'),
+          started_on: edu.at_css('Degree DatesOfAttendance StartDate AnyDate'),
+          ended_on: edu.at_css('Degree DatesOfAttendance EndDate AnyDate'),
+          major: edu.at_css('Degree DegreeMajor'),
+          minor: edu.at_css('Degree DegreeMinor'),
+          name: edu.at_css('School SchoolName')
+        }
+      end.map do |hsh|
+        format_hash hsh
+      end
+    end
+
+    def internships
+      positions 'internship'
+    end
+
+    def employments
+      positions 'directHire'
+    end
+
+    def positions type
+      @doc.css('PositionHistory').select do |emp|
+        emp.attr('positionType') == type
+      end.map do |emp|
+        {
+          "company": emp.at_css('OrgName OrganizationName'),
+          "description": emp.at_css('Description'),
+          "ended_on": emp.at_css('EndDate AnyDate'),
+          "started_on": emp.at_css('StartDate AnyDate'),
+          "title": emp.at_css('Title'),
+          "current_employer": emp.attr('currentEmployer') == 'true' ? true : false,
+        }
+      end.map do |hsh|
+        format_hash hsh
+      end
+    end
+
+    def to_xml
+      @result[:xml]
+    end
+
+private
+
+    def format_hash hash
+      formatted = hash.map do |k, v|
+        value = if v.blank?
+          nil
+        elsif [:started_on, :ended_on].include? k
+          begin
+            Date.strptime(v.text.strip, "%Y-%m-%d")
+          rescue ArgumentError
+            nil
+          end
+        elsif v.is_a?(Nokogiri::XML::Element)
+          if v.text && !v.text.blank?
+            v.text.strip
+          else
+            nil
+          end
+        elsif v.is_a?(String)
+          if v.blank?
+            nil
+          else
+            v.strip
+          end
+        else
+          v
+        end
+
+        [k.to_sym, value]
       end
 
-      result.body[:do_conversion_simplified_response][:do_conversion_simplified_result].to_s
+      Hash[formatted]
     end
   end
 end
